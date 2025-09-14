@@ -47,7 +47,7 @@ async def get_clients():
 
 
 
-@app.get("/api/clients/{")
+
 @app.post("/api/diagnose")
 async def diagnose_client(request: ClientRequest) -> DiagnosticResponse:
     """Запустить диагностику для клиента"""
