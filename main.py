@@ -1,12 +1,13 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List, Dict
-import time
+from typing import List, Dict, Any
+import asyncio
 from services.analytics import ClientAnalyzer
 
 app = FastAPI()
 
+# CORS настройки
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000"],  # Next.js dev server
@@ -14,8 +15,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-analyzer = ClientAnalyzer('data/client_1_transactions_3m.csv', 'data/client_1_transfers_3m.csv')
 
 
 class ClientRequest(BaseModel):
@@ -33,25 +32,50 @@ class DiagnosticResponse(BaseModel):
     recommendations: List[Recommendation]
 
 
-an = []
+# Хранилище созданных анализаторов и маппинг client_code -> analyzer
+analyzers: List[ClientAnalyzer] = []
+client_code_to_analyzer: Dict[int, ClientAnalyzer] = {}
 
+# Инициализация анализаторов
 for i in range(60):
     try:
-        an.append(ClientAnalyzer(f'data/client_{i + 1}_transactions_3m.csv', f'data/client_{i + 1}_transfers_3m.csv'))
+        analyzer = ClientAnalyzer(
+            f"data/client_{i+1}_transactions_3m.csv",
+            f"data/client_{i+1}_transfers_3m.csv",
+        )
+        analyzers.append(analyzer)
+
+        # Попробуем получить клиентов из данного анализатора (если метод get_all_clients есть)
+        try:
+            clients_part = analyzer.get_all_clients()
+            if isinstance(clients_part, list):
+                for c in clients_part:
+                    cid = c.get("client_code")
+                    if cid is not None:
+                        # если несколько анализаторов возвращают один и тот же client_code,
+                        # последний перезапишет, что обычно нормально (или можно сохранить список)
+                        client_code_to_analyzer[cid] = analyzer
+        except Exception:
+            # Если analyzer не поддерживает get_all_clients или упал — пропускаем маппинг
+            pass
+
     except Exception as e:
-        print(f"Warning: failed to initialize analyzer for client {i + 1}: {e}")
+        print(f"Warning: failed to initialize analyzer for client {i+1}: {e}")
         continue
 
 
 @app.get("/api/clients")
 async def get_clients():
-    clients: List[Dict] = []
+    """
+    Возвращает агрегированный список клиентов (уникальные по client_code).
+    """
+    clients: List[Dict[str, Any]] = []
     seen_client_codes = set()
 
-    for analyzer in an:
+    # Если есть метод get_all_clients у анализаторов — соберём их
+    for analyzer in analyzers:
         try:
             part = analyzer.get_all_clients()
-
             for c in part:
                 cid = c.get("client_code")
                 if cid is None:
@@ -60,55 +84,102 @@ async def get_clients():
                     seen_client_codes.add(cid)
                     clients.append(c)
         except Exception as e:
-
-            # В проде лучше использовать logger: logger.exception(...)
             print(f"Warning: failed to read clients from one analyzer: {e}")
             continue
 
+    # Если не удалось получить через get_all_clients, можно заполнить из маппинга
+    if not clients and client_code_to_analyzer:
+        for cid in client_code_to_analyzer.keys():
+            clients.append({"client_code": cid})
+
     if not clients:
-        # Если ни один analyzer не вернул клиентов — сообщаем об этом
         raise HTTPException(status_code=404, detail="Клиенты не найдены")
 
     return {"clients": clients}
 
 
-@app.post("/api/diagnose")
+@app.post("/api/diagnose", response_model=DiagnosticResponse)
 async def diagnose_client(request: ClientRequest) -> DiagnosticResponse:
-    """Запустить диагностику для клиента"""
+    """
+    Запустить диагностику для одного клиента (по client_code).
+    """
     try:
-        # Имитация времени обработки
-        time.sleep(2)  # В реальности анализ быстрый, но для UX добавим задержку
+        # Небольшая имитация задержки для UX; не блокирует event loop.
+        await asyncio.sleep(0.1)
 
-        # Анализ клиента
+        analyzer = client_code_to_analyzer.get(request.client_code)
+        if analyzer is None:
+            raise HTTPException(status_code=404, detail="Клиент не найден (analyzer не найден)")
+
         client_info = analyzer.analyze_client(request.client_code)
-
         if not client_info:
-            raise HTTPException(status_code=404, detail="Клиент не найден")
+            raise HTTPException(status_code=404, detail="Клиент не найден (данные)")
 
         products = analyzer.calculate_product_scores(client_info)
 
-        recommendations = []
+        recommendations: List[Recommendation] = []
         for product, benefit, confidence in products[:3]:  # Топ-3 рекомендации
-            message = analyzer.generate_notification(client_info, product, client_info['metrics'])
+            message = analyzer.generate_notification(client_info, product, client_info.get("metrics", {}))
             recommendations.append(Recommendation(
                 product=product,
                 message=message,
-                confidence=confidence
+                confidence=float(confidence)
             ))
 
         return DiagnosticResponse(
-            client_name=client_info['name'],
+            client_name=client_info.get("name", f"client_{request.client_code}"),
             recommendations=recommendations
         )
 
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/diagnose_all")
+async def diagnose_all():
+    """
+    Запустить диагностику для всех доступных клиентов (используя client_code_to_analyzer).
+    Возвращает список результатов и ошибок.
+    """
+    results = []
+    errors = []
+
+    # Если у вас очень много клиентов и тяжелая обработка — подумайте об батчировании/фоновом исполнении.
+    for client_code, analyzer in client_code_to_analyzer.items():
+        try:
+            client_info = analyzer.analyze_client(client_code)
+            if not client_info:
+                errors.append({"client_code": client_code, "error": "client data not found"})
+                continue
+
+            products = analyzer.calculate_product_scores(client_info)
+            recs = []
+            for product, benefit, confidence in products[:3]:
+                message = analyzer.generate_notification(client_info, product, client_info.get("metrics", {}))
+                recs.append({
+                    "product": product,
+                    "message": message,
+                    "confidence": float(confidence)
+                })
+
+            results.append({
+                "client_code": client_code,
+                "client_name": client_info.get("name"),
+                "recommendations": recs
+            })
+
+            # Небольшая пауза, чтобы не перегружать ресурсы (опционально)
+            await asyncio.sleep(0.01)
+
+        except Exception as e:
+            errors.append({"client_code": client_code, "error": str(e)})
+            continue
+
+    return {"results": results, "errors": errors}
 
 
 @app.get("/")
 async def root():
     return {"message": "API для диагностики клиентов банка"}
-
-
-
-
