@@ -10,7 +10,7 @@ app = FastAPI()
 # CORS настройки
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],  # Next.js dev server
+    allow_origins=["http://localhost:3000","https://decentrathon-4-0.vercel.app"],  # Next.js dev server
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -45,7 +45,7 @@ for i in range(60):
         )
         analyzers.append(analyzer)
 
-        # Попробуем получить клиентов из данного анализатора (если метод get_all_clients есть)
+
         try:
             clients_part = analyzer.get_all_clients()
             if isinstance(clients_part, list):
